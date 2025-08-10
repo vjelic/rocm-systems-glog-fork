@@ -53,13 +53,12 @@ def make_temp_view_query(view_name, query) -> str:
     return "CREATE TEMPORARY VIEW IF NOT EXISTS `{}` AS {}".format(view_name, query)
 
 
-def export_view(
-    connection: RocpdImportData, view_name, output_format, output_path, filename=""
+def export_query(
+    connection: RocpdImportData, query, view_name, output_format, output_path, filename=""
 ) -> None:
     """Write the contents of a SQL view to an output format."""
 
-    query = "SELECT * FROM `{}`".format(view_name)
-    query_one = "SELECT * FROM `{}` LIMIT 1".format(view_name)
+    query_one = "{} LIMIT 1".format(query)
 
     # just return if view is empty
     if not connection.execute(query_one).fetchone():
@@ -78,6 +77,12 @@ def export_view(
     export_path = os.path.join(output_path, output_filename)
     export_sqlite_query(
         connection, query, export_format=output_format, export_path=export_path
+    )
+
+
+def query_exporter(output_format, output_path, filename):
+    return lambda connection, query, view_name: export_query(
+        connection, query, view_name, output_format, output_path, filename
     )
 
 
@@ -160,7 +165,7 @@ def generate_summary_query(
             aggregated_data AD
             {total_duration_join}
         ORDER BY
-            {"AD.pid," if by_rank else ""} AD.total_duration DESC;
+            {"AD.pid," if by_rank else ""} AD.total_duration DESC
     """
 
     return (full_view_name, summary_query)
@@ -236,14 +241,14 @@ def generate_domain_query(connection: RocpdImportData, by_rank=False) -> Tuple[s
         FROM
             grouped_domains GD
             {join_condition}
-        {order_by};
+        {order_by}
     """
 
     return (view_name, domain_select)
 
 
-def create_summary_views(connection: RocpdImportData, by_rank=False) -> None:
-    """Create summary views for eligible temporary views in the database."""
+def export_summary_queries(connection: RocpdImportData, exporter, by_rank=False) -> None:
+    """Create summary queries for eligible temporary views in the database."""
 
     NAME_COLUMN_MAP = {
         "memory_allocations": "type",
@@ -263,28 +268,26 @@ def create_summary_views(connection: RocpdImportData, by_rank=False) -> None:
         if not required_columns.issubset(columns):
             continue
 
-        # Create regular summary view
+        # Create regular summary query
         summary_view_name, summary_query = generate_summary_query(
             view_name, name_column=NAME_COLUMN_MAP.get(view_name, "name")
         )
-        connection.execute(make_temp_view_query(summary_view_name, summary_query))
+        exporter(connection, summary_query, summary_view_name)
 
-        # Create per-rank summary
+        # Create per-rank summary query
         if by_rank:
             per_rank_view_name, summary_by_rank_query = generate_summary_query(
                 view_name,
                 name_column=NAME_COLUMN_MAP.get(view_name, "name"),
                 by_rank=True,
             )
-            connection.execute(
-                make_temp_view_query(per_rank_view_name, summary_by_rank_query)
-            )
+            exporter(connection, summary_by_rank_query, per_rank_view_name)
 
 
-def create_summary_region_views(
-    connection: RocpdImportData, by_rank=False, region_categories=None
+def export_summary_region_queries(
+    connection: RocpdImportData, exporter, by_rank=False, region_categories=None
 ) -> None:
-    """Create summary and region views"""
+    """Create summary and region queries"""
 
     query = "SELECT DISTINCT(category) FROM regions_and_samples;"
     categories = execute_statement(connection, query).fetchall()
@@ -311,18 +314,16 @@ def create_summary_region_views(
 
             connection.execute(temp_region_view)
 
-            # Create regular summary view
+            # Create regular summary query
             summary_view_name, summary_query = generate_summary_query(k)
-            connection.execute(make_temp_view_query(summary_view_name, summary_query))
+            exporter(connection, summary_query, summary_view_name)
 
-            # Create per-rank summary view
+            # Create per-rank summary query
             if by_rank:
                 per_rank_view_name, summary_by_rank_query = generate_summary_query(
                     k, by_rank=True
                 )
-                connection.execute(
-                    make_temp_view_query(per_rank_view_name, summary_by_rank_query)
-                )
+                exporter(connection, summary_by_rank_query, per_rank_view_name)
 
     # Markers
     if "MARKER" not in region_categories:
@@ -353,13 +354,13 @@ def create_summary_region_views(
         )
 
 
-def create_domain_view(connection: RocpdImportData, by_rank=False) -> str:
-    """Create a domain summary view by aggregating all summary views."""
+def export_domain_query(connection: RocpdImportData, exporter, by_rank=False) -> str:
+    """Create a domain summary query by aggregating all summary views."""
 
+    # Create the domain summary query
     view_name, domain_query = generate_domain_query(connection, by_rank=by_rank)
 
-    # Create the domain summary view
-    connection.execute(make_temp_view_query(view_name, domain_query))
+    exporter(connection, domain_query, view_name)
 
     return view_name
 
@@ -373,35 +374,19 @@ def generate_all_summaries(connection: RocpdImportData, **kwargs: Any) -> None:
     output_path = kwargs.get("output_path", "./rocpd-output-data")
     region_categories = kwargs.get("region_categories", None)
     output_format = kwargs.get("format", "console")
+    exporter = query_exporter(output_format, output_path, filename)
 
-    # create the temporary summary views
-    create_summary_views(connection, by_rank)
-    create_summary_region_views(connection, by_rank, region_categories=region_categories)
+    # export the summary queries
+    export_summary_queries(connection, exporter, by_rank)
+    export_summary_region_queries(
+        connection, exporter, by_rank, region_categories=region_categories
+    )
 
     if domain_summary:
-        create_domain_view(connection)
+        export_domain_query(connection, exporter)
         # Create domain summary per rank only if both domain_summary and summary_by_rank are enabled
         if by_rank:
-            create_domain_view(connection, by_rank=True)
-
-    # Write regular summary views
-    print("\nSummary files:")
-    summary_views = [
-        itr for itr in get_temp_view_names(connection) if itr.endswith("_summary")
-    ]
-    for v in summary_views:
-        export_view(connection, v, output_format, output_path, filename)
-
-    # Write per-rank summary views if flag is set
-    if by_rank:
-        print("\nSummary files by rank:")
-        summary_by_rank_views = [
-            itr
-            for itr in get_temp_view_names(connection)
-            if itr.endswith("_summary_by_rank")
-        ]
-        for v in summary_by_rank_views:
-            export_view(connection, v, output_format, output_path, filename)
+            export_domain_query(connection, exporter, by_rank=True)
 
 
 #
